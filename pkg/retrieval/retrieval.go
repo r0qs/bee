@@ -49,7 +49,6 @@ type Service struct {
 	logger        logging.Logger
 	accounting    accounting.Interface
 	pricer        *pricer.Service
-	validator     swarm.Validator
 	tracer        *tracing.Tracer
 }
 
