@@ -85,6 +85,11 @@ const (
 	retrieveRetryIntervalDuration = 5 * time.Second
 )
 
+type retrieveChunkResult struct {
+	chunk swarm.Chunk
+	err   error
+}
+
 func (s *Service) RetrieveChunk(ctx context.Context, addr swarm.Address) (swarm.Chunk, error) {
 	ctx, cancel := context.WithTimeout(ctx, maxPeers*retrieveChunkTimeout)
 	defer cancel()
@@ -99,24 +104,27 @@ func (s *Service) RetrieveChunk(ctx context.Context, addr swarm.Address) (swarm.
 
 		var (
 			peerAttempt int
+			resultC     = make(chan retrieveChunkResult)
 			wgChan      sync.WaitGroup
 		)
 
-		doneC := make(chan swarm.Chunk)
-		errC := make(chan error)
+		wgChan.Add(maxPeers)
 
 		defer func() {
+			if peerAttempt != maxPeers {
+				wgChan.Add(peerAttempt - maxPeers)
+			}
+		}()
+
+		go func() {
 			wgChan.Wait()
 
-			close(doneC)
-			close(errC)
+			close(resultC)
 		}()
 
 		for {
 			if peerAttempt < maxPeers {
 				peerAttempt++
-
-				wgChan.Add(1)
 
 				go func() {
 					defer wgChan.Done()
@@ -125,7 +133,7 @@ func (s *Service) RetrieveChunk(ctx context.Context, addr swarm.Address) (swarm.
 					if err != nil {
 						if peer.IsZero() {
 							select {
-							case errC <- err:
+							case resultC <- retrieveChunkResult{err: err}:
 							default:
 							}
 							return
@@ -136,7 +144,7 @@ func (s *Service) RetrieveChunk(ctx context.Context, addr swarm.Address) (swarm.
 					}
 
 					select {
-					case doneC <- chunk:
+					case resultC <- retrieveChunkResult{chunk: chunk}:
 					default:
 					}
 				}()
@@ -147,12 +155,17 @@ func (s *Service) RetrieveChunk(ctx context.Context, addr swarm.Address) (swarm.
 			select {
 			case <-ticker.C:
 				break
-			case chunk := <-doneC:
-				return chunk, nil
-			case err := <-errC:
-				if err != nil {
-					return nil, err
+			case result := <-resultC:
+				if result.err != nil {
+					return nil, result.err
 				}
+
+				if result.chunk == nil {
+					logger.Tracef("retrieval: failed to get chunk %s", addr)
+					return nil, storage.ErrNotFound
+				}
+
+				return result.chunk, nil
 			case <-ctx.Done():
 				logger.Tracef("retrieval: failed to get chunk %s: %v", addr, ctx.Err())
 				return nil, storage.ErrNotFound
