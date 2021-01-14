@@ -126,7 +126,6 @@ func (s *Service) RetrieveChunk(ctx context.Context, addr swarm.Address) (swarm.
 			case <-ticker.C:
 				// break
 			case chunk := <-resultC:
-				peersResults++
 				return chunk, nil
 			case <-errC:
 				peersResults++
