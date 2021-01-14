@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/ethersphere/bee/pkg/accounting"
@@ -85,27 +84,7 @@ const (
 	retrieveRetryIntervalDuration = 5 * time.Second
 )
 
-type retrieveChunkResult struct {
-	chunk swarm.Chunk
-	err   error
-}
-
 func (s *Service) RetrieveChunk(ctx context.Context, addr swarm.Address) (swarm.Chunk, error) {
-	ctx, cancel := context.WithTimeout(ctx, maxPeers*retrieveChunkTimeout)
-
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-
-	defer func() {
-		wg.Done()
-	}()
-
-	go func() {
-		wg.Wait()
-		cancel()
-	}()
-
 	v, err, _ := s.singleflight.Do(addr.String(), func() (interface{}, error) {
 		span, logger, ctx := s.tracer.StartSpanFromContext(ctx, "retrieve-chunk", s.logger, opentracing.Tag{Key: "address", Value: addr.String()})
 		defer span.Finish()
@@ -118,46 +97,26 @@ func (s *Service) RetrieveChunk(ctx context.Context, addr swarm.Address) (swarm.
 		var (
 			peerAttempt  int
 			peersResults int
-			resultC      = make(chan retrieveChunkResult)
+			resultC      = make(chan swarm.Chunk, maxPeers)
+			errC         = make(chan error, maxPeers)
 		)
-
-		wg.Add(maxPeers)
-
-		defer func() {
-			if peerAttempt != maxPeers {
-				wg.Add(peerAttempt - maxPeers)
-			}
-		}()
-
-		go func() {
-			wg.Wait()
-			close(resultC)
-		}()
 
 		for {
 			if peerAttempt < maxPeers {
 				peerAttempt++
 
 				go func() {
-					defer wg.Done()
-
 					chunk, peer, err := s.retrieveChunk(ctx, addr, sp)
 					if err != nil {
 						if !peer.IsZero() {
 							logger.Debugf("retrieval: failed to get chunk %s from peer %s: %v", addr, peer, err)
 						}
 
-						select {
-						case resultC <- retrieveChunkResult{err: err}:
-						default:
-						}
+						errC <- err
 						return
 					}
 
-					select {
-					case resultC <- retrieveChunkResult{chunk: chunk}:
-					default:
-					}
+					resultC <- chunk
 				}()
 			} else {
 				ticker.Stop()
@@ -166,19 +125,14 @@ func (s *Service) RetrieveChunk(ctx context.Context, addr swarm.Address) (swarm.
 			select {
 			case <-ticker.C:
 				// break
-			case result := <-resultC:
+			case chunk := <-resultC:
 				peersResults++
 
-				if result.err != nil {
-					break
-				}
+				return chunk, nil
+			case <-errC:
+				peersResults++
 
-				if result.chunk == nil {
-					logger.Tracef("retrieval: failed to get chunk %s", addr)
-					return nil, storage.ErrNotFound
-				}
-
-				return result.chunk, nil
+				break
 			case <-ctx.Done():
 				logger.Tracef("retrieval: failed to get chunk %s: %v", addr, ctx.Err())
 				return nil, ctx.Err()
